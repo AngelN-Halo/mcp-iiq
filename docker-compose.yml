@@ -1,0 +1,36 @@
+services:
+  mcp-iiq:
+    build: .
+    image: mcp-iiq:0.1.0
+    container_name: mcp-iiq
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8085:8085"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    pids_limit: 96
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - internal
+      - proxy
+
+networks:
+  internal:
+    external: true
+    name: ${IIQ_INTERNAL_NETWORK:-iiq-internal}
+  proxy:
+    external: true
+    name: proxy
