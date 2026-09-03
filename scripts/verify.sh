@@ -6,7 +6,7 @@ cd "$project_dir"
 
 docker run --rm \
     -v "$project_dir/tests:/app/tests:ro" \
-    mcp-iiq:0.1.0 \
+    mcp-iiq:0.2.0 \
     python -m pytest -q /app/tests
 
 docker compose up -d
@@ -32,7 +32,7 @@ docker exec mcp-iiq python -c "import os,httpx; r=httpx.get('http://127.0.0.1:80
 docker run --rm \
     --network proxy \
     --entrypoint python \
-    mcp-iiq:0.1.0 \
+    mcp-iiq:0.2.0 \
     -c "import urllib.request; print('proxy_network_health='+str(urllib.request.urlopen('http://mcp-iiq:8085/health',timeout=5).status))"
 
 docker compose ps

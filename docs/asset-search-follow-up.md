@@ -1,33 +1,37 @@
 # Asset inventory search follow-up
 
+Status: implemented in version 0.2.0 on 2026-09-03 as `iiq_search_assets`.
+
 ## Finding
 
 The Incident IQ integration user has been granted full read-only access to assets by the IIQ system manager. The current inability to answer inventory questions is therefore an integration-surface limitation, not an inherent consequence of read-only access.
 
-The service currently exposes only:
+The service previously exposed only:
 
 - `iiq_get_asset` for lookup by IIQ asset record identifier; and
 - `iiq_get_asset_by_tag` for an exact asset-tag lookup.
 
-It does not expose an operation that lists, filters, aggregates, or counts assets. The disabled `iiq_advanced_read` escape hatch should not be enabled merely to work around this gap.
+Version 0.2.0 closes that gap without enabling the disabled `iiq_advanced_read` escape hatch.
 
 ## Desired read-only capability
 
-Add a named, bounded asset search operation capable of supporting questions such as:
+The named, bounded asset search operation supports questions such as:
 
 - How many Chromebook Plus devices are available?
 - How many assets were purchased during July 2026?
 - Which matching devices are assigned, available, or in repair?
 
-Candidate filters include:
+Supported filters include:
 
 - purchase-date range;
 - asset type, category, manufacturer, and model;
-- availability, assignment, and repair/status values;
+- availability, assignment, and repair values represented by IIQ asset statuses;
 - location; and
 - exact or conservatively normalized asset identifiers.
 
 ## Implementation and safety requirements
+
+The live tenant confirmed the non-mutating `POST /api/v1.0/assets` query endpoint and its `Items` plus `Paging.TotalRows` response schema before implementation. The following safeguards are implemented:
 
 1. Confirm the documented IIQ asset-list/search endpoint and request schema against the live tenant.
 2. Test that endpoint with the existing integration credential. A successful response confirms the granted read-only asset access; an IIQ `401` or `403` would indicate a credential or role issue that must be resolved with the system manager.
@@ -41,4 +45,4 @@ Candidate filters include:
 
 ## Assistant wording
 
-Until this capability is implemented, the assistant should say that the current integration does not expose asset listing or filtering. It should not imply that read-only access inherently prevents inventory searches or counts.
+The assistant can now use `iiq_search_assets` for inventory listing and counts. It should continue to distinguish MCP surface limitations from IIQ credential or role failures.

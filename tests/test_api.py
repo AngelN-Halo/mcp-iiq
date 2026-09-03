@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.client import validate_advanced_path
+from app.client import IIQClient, validate_advanced_path
 from app.config import Settings
 from app.main import app, iiq, settings
 
@@ -342,3 +345,167 @@ def test_advanced_path_rejects_non_allowlisted_resource() -> None:
         assert getattr(exc, "status_code", None) == 403
     else:
         raise AssertionError("non-allowlisted resource was accepted")
+
+
+def test_asset_search_resolves_filters_paginates_and_returns_compact_results(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    asset_calls = []
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        if path == "filters":
+            facet = body["Facets"][0]
+            assert body["ResultsFilter"]["EntityName"] == "assets"
+            if facet == "model":
+                return {
+                    "Items": [
+                        {"Facet": "model", "Name": "Example Chromebook Plus 14", "Id": "model-1"},
+                        {"Facet": "model", "Name": "Example Chromebook Plus 15", "Id": "model-2"},
+                    ]
+                }
+            assert facet == "assetstatus"
+            return {
+                "Items": [
+                    {"Facet": "assetstatus", "Name": "Available", "Id": "available-id"},
+                    {"Facet": "assetstatus", "Name": "Available for Parts", "Id": "parts-id"},
+                ]
+            }
+        assert path == "assets"
+        asset_calls.append((body, query))
+        assert body["Schema"] == "All"
+        assert body["Filters"] == [
+            {"Facet": "model", "Id": "model-1", "GroupIndex": 0},
+            {"Facet": "model", "Id": "model-2", "GroupIndex": 0},
+            {"Facet": "assetstatus", "Id": "available-id", "GroupIndex": 0},
+        ]
+        page = query["$p"]
+        items = [
+            {
+                "AssetId": f"asset-{page * 2 + index}",
+                "AssetTag": f"TEST-{page * 2 + index}",
+                "SerialNumber": "synthetic",
+                "Model": {
+                    "Name": "Example Chromebook Plus 14",
+                    "Manufacturer": {"Name": "Example Manufacturer"},
+                    "Category": {"Name": "Laptop"},
+                },
+                "Status": {"Name": "Available"},
+                "Location": {"Name": "Example School"},
+                "Secret": "must-not-leak",
+            }
+            for index in range(2 if page == 0 else 1)
+        ]
+        return {"Items": items, "Paging": {"TotalRows": 3}}
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"model": "Chromebook Plus", "status": "Available", "page_size": 2, "limit": 10},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["total_count"] == 3
+    assert result["returned_count"] == 3
+    assert result["pages_scanned"] == 2
+    assert result["truncated"] is False
+    assert result["assets"][0]["manufacturer"] == "Example Manufacturer"
+    assert "Secret" not in result["assets"][0]
+    assert [call[1]["$p"] for call in asset_calls] == [0, 1]
+
+
+def test_asset_search_purchase_dates_and_result_limit_are_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert path == "assets"
+        assert body["Filters"] == [
+            {"Facet": "purchaseddate", "Value": "daterange:07/01/2026-07/31/2026", "GroupIndex": 0}
+        ]
+        assert query["$s"] == 2
+        return {
+            "Items": [{"AssetId": "one"}, {"AssetId": "two"}],
+            "Paging": {"TotalRows": 50},
+        }
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"purchased_after": "2026-07-01", "purchased_before": "2026-07-31", "limit": 2},
+    )
+    assert response.status_code == 200
+    assert response.json()["total_count"] == 50
+    assert response.json()["truncated"] is True
+
+
+def test_asset_search_rejects_partial_or_excessive_date_windows(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    partial = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"purchased_after": "2026-07-01"},
+    )
+    excessive = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"purchased_after": "2025-01-01", "purchased_before": "2026-07-31"},
+    )
+    assert partial.status_code == 422
+    assert excessive.status_code == 422
+
+
+def test_asset_search_handles_empty_results(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert path == "assets"
+        return {"Items": [], "Paging": {"TotalRows": 0}}
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post("/assets/search", headers={"Authorization": "Bearer expected"}, json={})
+    assert response.status_code == 200
+    assert response.json()["assets"] == []
+    assert response.json()["total_count"] == 0
+
+
+def test_asset_search_propagates_iiq_permission_failure(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        raise HTTPException(502, "Incident IQ rejected the integration credential or its permissions")
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post("/assets/search", headers={"Authorization": "Bearer expected"}, json={})
+    assert response.status_code == 502
+    assert "permissions" in response.json()["detail"]
+
+
+def test_asset_query_enforces_upstream_response_size_limit(monkeypatch) -> None:
+    configured = Settings(iiq_base_url="https://example.invalid", iiq_api_token="synthetic", iiq_max_response_bytes=10)
+    test_client = IIQClient(configured)
+
+    class FakeResponse:
+        content = b"12345678901"
+        status_code = 200
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("app.client.httpx.AsyncClient", FakeAsyncClient)
+    try:
+        asyncio.run(test_client.post_read_query("assets", "test-correlation", {"Filters": []}))
+    except HTTPException as exc:
+        assert exc.status_code == 502
+        assert "size limit" in exc.detail
+    else:
+        raise AssertionError("oversized Incident IQ response was accepted")

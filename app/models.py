@@ -40,6 +40,62 @@ class HealthResponse(BaseModel):
     advanced_read_enabled: bool
 
 
+class AssetSearchRequest(BaseModel):
+    model: str | None = Field(default=None, min_length=2, max_length=150, description="Model name or distinctive words, such as Chromebook Plus. Exact matches are preferred; otherwise all IIQ model names containing every word are included.")
+    asset_type: str | None = Field(default=None, min_length=2, max_length=100)
+    category: str | None = Field(default=None, min_length=2, max_length=100)
+    manufacturer: str | None = Field(default=None, min_length=2, max_length=100)
+    status: str | None = Field(default=None, min_length=2, max_length=100, description="Asset status, such as Available or In Repair.")
+    location: str | None = Field(default=None, min_length=2, max_length=150)
+    asset_tag: str | None = Field(default=None, min_length=1, max_length=100)
+    serial_number: str | None = Field(default=None, min_length=1, max_length=150)
+    purchased_after: date | None = None
+    purchased_before: date | None = None
+    limit: int = Field(default=100, ge=1, le=200, description="Maximum compact asset summaries returned.")
+    page_size: int = Field(default=100, ge=1, le=100)
+    max_pages: int = Field(default=5, ge=1, le=5)
+
+    @field_validator("model", "asset_type", "category", "manufacturer", "status", "location", "asset_tag", "serial_number")
+    @classmethod
+    def normalize_asset_text(cls, value: str | None) -> str | None:
+        return " ".join(value.split()) if value is not None else None
+
+    def purchase_bounds(self) -> tuple[date, date] | None:
+        if self.purchased_after is None and self.purchased_before is None:
+            return None
+        if self.purchased_after is None or self.purchased_before is None:
+            raise ValueError("purchased_after and purchased_before must be supplied together")
+        if self.purchased_before < self.purchased_after:
+            raise ValueError("purchased_before cannot be earlier than purchased_after")
+        if self.purchased_before - self.purchased_after > timedelta(days=366):
+            raise ValueError("Asset purchase-date searches are limited to a 367-day inclusive window")
+        return self.purchased_after, self.purchased_before
+
+
+class AssetSummary(BaseModel):
+    asset_id: str | None = None
+    asset_tag: str | None = None
+    serial_number: str | None = None
+    name: str | None = None
+    asset_type: str | None = None
+    category: str | None = None
+    manufacturer: str | None = None
+    model: str | None = None
+    status: str | None = None
+    location: str | None = None
+    room: str | None = None
+    purchased_date: str | None = None
+
+
+class AssetSearchResponse(BaseModel):
+    correlation_id: str
+    total_count: int
+    returned_count: int
+    pages_scanned: int
+    truncated: bool
+    assets: list[AssetSummary]
+
+
 class TicketSearchRequest(BaseModel):
     assigned_to: str = Field(
         min_length=2,

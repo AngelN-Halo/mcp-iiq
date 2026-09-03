@@ -13,6 +13,9 @@ from .client import IIQClient, safe_segment, validate_advanced_path
 from .config import get_settings
 from .models import (
     AdvancedReadRequest,
+    AssetSearchRequest,
+    AssetSearchResponse,
+    AssetSummary,
     FilteredTicketSearchRequest,
     FilteredTicketSearchResponse,
     HealthResponse,
@@ -36,10 +39,11 @@ iiq = IIQClient(settings)
 
 app = FastAPI(
     title="Incident IQ Read-Only API",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Read-only, least-privileged OpenAPI interface for Incident IQ. "
-        "This service implements only downstream HTTP GET requests and contains no ticket mutation operations."
+        "This service implements downstream HTTP GET requests plus a fixed allowlist of non-mutating query POSTs, "
+        "and contains no ticket or asset mutation operations."
     ),
 )
 bearer = HTTPBearer(
@@ -593,19 +597,150 @@ async def search_tickets(body: TicketSearchRequest, request: Request, response: 
     )
 
 
-@app.get(
-    "/assets/{asset_id}",
-    operation_id="iiq_get_asset",
-    summary="Get one Incident IQ asset",
-    description="Retrieve one authorized asset by its Incident IQ record identifier. This operation cannot modify the asset.",
-    response_model=IIQResult,
+_ASSET_FILTER_FIELDS = {
+    "model": "model",
+    "asset_type": "assettype",
+    "category": "category",
+    "manufacturer": "manufacturer",
+    "status": "assetstatus",
+    "location": "location",
+}
+
+
+async def _asset_filter_candidates(query: str, facet: str, cid: str) -> list[tuple[str, str]]:
+    raw = await iiq.post_read_query(
+        "filters",
+        cid,
+        {
+            "Facets": [facet],
+            "Query": query,
+            "ResultsFilter": {"EntityName": "assets", "ShowAll": False, "ShowDeleted": False},
+        },
+    )
+    matches: set[tuple[str, str]] = set()
+
+    def collect(value) -> None:
+        if isinstance(value, dict):
+            found_facet = _display(_ci_get(value, "Facet"))
+            name = _display(_ci_get(value, "Name"))
+            identifier = _display(_ci_get(value, "Id"))
+            if found_facet and name and identifier and found_facet.casefold() == facet.casefold():
+                matches.add((name, identifier))
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    collect(raw)
+    wanted = " ".join(query.split()).casefold()
+    exact = [match for match in matches if " ".join(match[0].split()).casefold() == wanted]
+    if exact:
+        return sorted(exact)
+    words = wanted.split()
+    return sorted((match for match in matches if all(word in match[0].casefold() for word in words)))
+
+
+def _asset_records(raw) -> list[dict]:
+    records = _ci_get(raw, "Items") if isinstance(raw, dict) else None
+    if not isinstance(records, list):
+        raise HTTPException(502, "Incident IQ asset search returned an unexpected response shape")
+    return [record for record in records if isinstance(record, dict)]
+
+
+def _asset_total(raw) -> int:
+    paging = _ci_get(raw, "Paging") if isinstance(raw, dict) else None
+    total = _ci_get(paging, "TotalRows") if isinstance(paging, dict) else None
+    if not isinstance(total, int) or total < 0:
+        raise HTTPException(502, "Incident IQ asset search returned invalid paging metadata")
+    return total
+
+
+def _asset_summary(record: dict) -> AssetSummary:
+    model = _ci_get(record, "Model")
+    return AssetSummary(
+        asset_id=_display(_ci_get(record, "AssetId", "Id")),
+        asset_tag=_display(_ci_get(record, "AssetTag")),
+        serial_number=_display(_ci_get(record, "SerialNumber")),
+        name=_display(_ci_get(record, "AssetName", "Name")),
+        asset_type=_display(_ci_get(record, "AssetTypeName", "AssetType")),
+        category=_display(_ci_get(model, "Category")) if isinstance(model, dict) else None,
+        manufacturer=_display(_ci_get(model, "Manufacturer")) if isinstance(model, dict) else None,
+        model=_display(model),
+        status=_display(_ci_get(record, "Status")),
+        location=_display(_ci_get(record, "Location")),
+        room=_display(_ci_get(record, "LocationRoom")),
+        purchased_date=_display(_ci_get(record, "PurchasedDate", "PurchaseDate")),
+    )
+
+
+@app.post(
+    "/assets/search",
+    operation_id="iiq_search_assets",
+    summary="Search and count Incident IQ assets",
+    description=(
+        "Search visible assets using allowlisted model, type, category, manufacturer, status, location, identifier, "
+        "and purchase-date filters. Returns IIQ's exact filtered total plus bounded compact summaries; it cannot modify assets."
+    ),
+    response_model=AssetSearchResponse,
     dependencies=[Depends(require_caller)],
     tags=["assets"],
 )
-async def get_asset(asset_id: str, request: Request, response: Response) -> IIQResult:
+async def search_assets(body: AssetSearchRequest, request: Request, response: Response) -> AssetSearchResponse:
+    try:
+        purchase_bounds = body.purchase_bounds()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     cid = correlation_id(request, response)
-    path = f"assets/{safe_segment(asset_id, 'asset ID')}"
-    return IIQResult(correlation_id=cid, resource="asset", data=await iiq.get(path, cid))
+    filters: list[dict] = []
+    for field, facet in _ASSET_FILTER_FIELDS.items():
+        value = getattr(body, field)
+        if value is None:
+            continue
+        candidates = await _asset_filter_candidates(value, facet, cid)
+        if not candidates:
+            raise HTTPException(404, f"No matching Incident IQ asset {field.replace('_', ' ')} filter was found")
+        if len(candidates) > 25:
+            raise HTTPException(409, f"The asset {field.replace('_', ' ')} filter is too broad; use a more specific value")
+        filters.extend({"Facet": facet, "Id": identifier, "GroupIndex": 0} for _, identifier in candidates)
+    if body.asset_tag:
+        filters.append({"Facet": "AssetTag", "Value": body.asset_tag, "GroupIndex": 0})
+    if body.serial_number:
+        filters.append({"Facet": "AssetSerialNumber", "Value": body.serial_number, "GroupIndex": 0})
+    if purchase_bounds:
+        start, end = purchase_bounds
+        value = f"daterange:{start:%m/%d/%Y}-{end:%m/%d/%Y}"
+        filters.append({"Facet": "purchaseddate", "Value": value, "GroupIndex": 0})
+
+    assets: list[AssetSummary] = []
+    total_count = 0
+    pages_scanned = 0
+    for page in range(body.max_pages):
+        remaining = body.limit - len(assets)
+        if remaining <= 0:
+            break
+        page_size = min(body.page_size, remaining)
+        raw = await iiq.post_read_query(
+            "assets",
+            cid,
+            {"Schema": "All", "OnlyShowDeleted": False, "Filters": filters, "FilterByViewPermission": True},
+            {"$s": page_size, "$p": page, "$o": "AssetTag ASC"},
+        )
+        pages_scanned += 1
+        records = _asset_records(raw)
+        total_count = _asset_total(raw)
+        assets.extend(_asset_summary(record) for record in records)
+        if not records or len(assets) >= total_count:
+            break
+    assets = assets[: body.limit]
+    return AssetSearchResponse(
+        correlation_id=cid,
+        total_count=total_count,
+        returned_count=len(assets),
+        pages_scanned=pages_scanned,
+        truncated=total_count > len(assets),
+        assets=assets,
+    )
 
 
 @app.get(
@@ -620,6 +755,21 @@ async def get_asset(asset_id: str, request: Request, response: Response) -> IIQR
 async def get_asset_by_tag(asset_tag: str, request: Request, response: Response) -> IIQResult:
     cid = correlation_id(request, response)
     path = f"assets/assettag/search/{safe_segment(asset_tag, 'asset tag')}"
+    return IIQResult(correlation_id=cid, resource="asset", data=await iiq.get(path, cid))
+
+
+@app.get(
+    "/assets/{asset_id}",
+    operation_id="iiq_get_asset",
+    summary="Get one Incident IQ asset",
+    description="Retrieve one authorized asset by its Incident IQ record identifier. This operation cannot modify the asset.",
+    response_model=IIQResult,
+    dependencies=[Depends(require_caller)],
+    tags=["assets"],
+)
+async def get_asset(asset_id: str, request: Request, response: Response) -> IIQResult:
+    cid = correlation_id(request, response)
+    path = f"assets/{safe_segment(asset_id, 'asset ID')}"
     return IIQResult(correlation_id=cid, resource="asset", data=await iiq.get(path, cid))
 
 

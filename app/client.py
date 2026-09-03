@@ -61,7 +61,7 @@ class IIQClient:
         query: dict[str, Any] | None = None,
     ) -> Any:
         """Issue POST only for a fixed, non-mutating IIQ search endpoint."""
-        if relative_path.strip("/").lower() not in {"tickets", "search", "search/v2", "filters"}:
+        if relative_path.strip("/").lower() not in {"tickets", "assets", "search", "search/v2", "filters"}:
             raise HTTPException(500, "POST read queries are restricted to approved search endpoints")
         return await self._request("POST", relative_path, correlation_id, query=query, body=body)
 

@@ -1,7 +1,7 @@
 services:
   mcp-iiq:
     build: .
-    image: mcp-iiq:0.1.0
+    image: mcp-iiq:0.2.0
     container_name: mcp-iiq
     restart: unless-stopped
     env_file:
