@@ -1,7 +1,7 @@
 services:
   mcp-iiq:
     build: .
-    image: mcp-iiq:0.2.0
+    image: mcp-iiq:0.3.0
     container_name: mcp-iiq
     restart: unless-stopped
     env_file:
@@ -10,7 +10,7 @@ services:
       - "127.0.0.1:8085:8085"
     read_only: true
     tmpfs:
-      - /tmp:size=32m,noexec,nosuid
+      - /tmp:size=64m,noexec,nosuid
     security_opt:
       - no-new-privileges:true
     cap_drop:

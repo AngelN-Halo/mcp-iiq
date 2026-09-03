@@ -2,7 +2,7 @@
 
 Read-only OpenAPI interface for Incident IQ. It is designed for registration as an OpenAPI tool in an AI/MCP environment while keeping the Incident IQ token server-side.
 
-Despite the repository name, version 0.2 is intentionally an **OpenAPI service**, not a native stdio/SSE MCP transport. This makes it straightforward to register in Open WebUI or any client that imports OpenAPI. A native MCP adapter can be added later over the same guarded client.
+Despite the repository name, version 0.3 is intentionally an **OpenAPI service**, not a native stdio/SSE MCP transport. This makes it straightforward to register in Open WebUI or any client that imports OpenAPI. A native MCP adapter can be added later over the same guarded client.
 
 ## Safety model
 
@@ -27,6 +27,7 @@ Despite the repository name, version 0.2 is intentionally an **OpenAPI service**
 - `iiq_get_asset` — retrieve one asset by IIQ record identifier
 - `iiq_get_asset_by_tag` — exact asset-tag lookup
 - `iiq_search_assets` — filter, list, and count assets by model, type, category, manufacturer, status, location, identifiers, or purchase-date window
+- `iiq_export_assets_csv` — create a bounded, short-lived CSV download for matching assets without returning every row to model context
 - `iiq_get_user` — retrieve one user by IIQ identifier
 - `iiq_list_locations` — retrieve visible locations
 - `iiq_advanced_read` — optional, disabled-by-default allowlisted GET escape hatch
@@ -101,6 +102,8 @@ For technician-assistant behavior, use the reusable prompt in `docs/technician-a
 Future write-enabled ticket correction and routing ideas are captured in `docs/future-ticket-adjustment-automation.md`. The initial design is recommendation-only with technician approval, exact taxonomy IDs, confidence/stop rules, and an audit trail.
 
 Asset inventory questions use `iiq_search_assets`. The operation resolves human-readable IIQ model, type, category, manufacturer, status, and location filters, supports exact asset-tag/serial filters and bounded purchase-date windows, and returns both IIQ's filtered total and compact asset summaries. For example, use `model: "Chromebook Plus"` with `status: "Available"` to count available Chromebook Plus models, or a July 2026 `purchased_after`/`purchased_before` window to count purchases. Results are capped at 200 summaries over no more than five pages; `total_count` remains the exact IIQ count and `truncated` indicates whether summaries were omitted.
+
+For a downloadable report or a large matching inventory, use `iiq_export_assets_csv` with the same filters. It writes normalized rows to container temporary storage, neutralizes spreadsheet-formula prefixes, and returns only a count plus an opaque download link. Reports expire automatically (15 minutes by default), use private/no-store download headers, and are capped at 25,000 rows by both the request schema and server configuration. Treat each unexpired report URL as sensitive because possession of its random token permits download; keep the service behind the same authenticated gateway and network controls as the OpenAPI endpoint.
 
 Example panel workflow:
 

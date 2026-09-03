@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import json
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -509,3 +512,79 @@ def test_asset_query_enforces_upstream_response_size_limit(monkeypatch) -> None:
         assert "size limit" in exc.detail
     else:
         raise AssertionError("oversized Incident IQ response was accepted")
+
+
+def test_asset_csv_export_creates_bounded_download_without_rows_in_tool_response(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    monkeypatch.setattr(settings, "iiq_export_max_rows", 25_000)
+    monkeypatch.setattr(settings, "iiq_export_page_size", 1)
+    monkeypatch.setattr(settings, "iiq_report_ttl_seconds", 900)
+    monkeypatch.setattr(settings, "iiq_public_base_url", "")
+    monkeypatch.setattr("app.main.REPORT_DIRECTORY", tmp_path)
+    calls = []
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert path == "assets"
+        calls.append(query)
+        index = query["$p"]
+        return {
+            "Items": [
+                {
+                    "AssetId": f"asset-{index}",
+                    "AssetTag": "=FORMULA" if index == 0 else f"TEST-{index}",
+                    "SerialNumber": f"SERIAL-{index}",
+                    "Model": {"Name": "Synthetic Model"},
+                    "Status": {"Name": "Available"},
+                }
+            ],
+            "Paging": {"TotalRows": 3},
+        }
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/export",
+        headers={"Authorization": "Bearer expected"},
+        json={"max_rows": 2},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["total_count"] == 3
+    assert result["exported_count"] == 2
+    assert result["truncated"] is True
+    assert "assets" not in result
+    assert [call["$p"] for call in calls] == [0, 1]
+
+    download = client.get(result["download_url"])
+    assert download.status_code == 200
+    assert download.headers["cache-control"] == "no-store, private"
+    rows = list(csv.DictReader(io.StringIO(download.content.decode("utf-8-sig"))))
+    assert len(rows) == 2
+    assert rows[0]["AssetTag"] == "'=FORMULA"
+    assert list(rows[0]) == [
+        "AssetId", "AssetTag", "SerialNumber", "Name", "AssetType", "Category",
+        "Manufacturer", "Model", "Status", "Location", "Room", "PurchasedDate",
+    ]
+
+
+def test_asset_csv_download_expires_and_removes_files(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    monkeypatch.setattr("app.main.REPORT_DIRECTORY", tmp_path)
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        return {"Items": [], "Paging": {"TotalRows": 0}}
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    created = client.post(
+        "/assets/export",
+        headers={"Authorization": "Bearer expected"},
+        json={"max_rows": 1},
+    ).json()
+    metadata_path = next(tmp_path.glob("*.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    expired = client.get(created["download_url"])
+    assert expired.status_code == 404
+    assert not list(tmp_path.iterdir())
+    assert client.get("/reports/assets/not-a-valid-token").status_code == 404

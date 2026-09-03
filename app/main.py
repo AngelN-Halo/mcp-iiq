@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import csv
 import hmac
 import html
+import json
 import logging
 import re
+import secrets
+import time
 import uuid
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .client import IIQClient, safe_segment, validate_advanced_path
 from .config import get_settings
 from .models import (
     AdvancedReadRequest,
+    AssetExportRequest,
+    AssetExportResponse,
+    AssetFilterRequest,
     AssetSearchRequest,
     AssetSearchResponse,
     AssetSummary,
@@ -36,10 +45,11 @@ from .models import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 settings = get_settings()
 iiq = IIQClient(settings)
+REPORT_DIRECTORY = Path("/tmp/mcp-iiq-reports")
 
 app = FastAPI(
     title="Incident IQ Read-Only API",
-    version="0.2.0",
+    version="0.3.0",
     description=(
         "Read-only, least-privileged OpenAPI interface for Incident IQ. "
         "This service implements downstream HTTP GET requests plus a fixed allowlist of non-mutating query POSTs, "
@@ -605,6 +615,20 @@ _ASSET_FILTER_FIELDS = {
     "status": "assetstatus",
     "location": "location",
 }
+_ASSET_CSV_FIELDS = [
+    "AssetId",
+    "AssetTag",
+    "SerialNumber",
+    "Name",
+    "AssetType",
+    "Category",
+    "Manufacturer",
+    "Model",
+    "Status",
+    "Location",
+    "Room",
+    "PurchasedDate",
+]
 
 
 async def _asset_filter_candidates(query: str, facet: str, cid: str) -> list[tuple[str, str]]:
@@ -674,24 +698,11 @@ def _asset_summary(record: dict) -> AssetSummary:
     )
 
 
-@app.post(
-    "/assets/search",
-    operation_id="iiq_search_assets",
-    summary="Search and count Incident IQ assets",
-    description=(
-        "Search visible assets using allowlisted model, type, category, manufacturer, status, location, identifier, "
-        "and purchase-date filters. Returns IIQ's exact filtered total plus bounded compact summaries; it cannot modify assets."
-    ),
-    response_model=AssetSearchResponse,
-    dependencies=[Depends(require_caller)],
-    tags=["assets"],
-)
-async def search_assets(body: AssetSearchRequest, request: Request, response: Response) -> AssetSearchResponse:
+async def _build_asset_filters(body: AssetFilterRequest, cid: str) -> list[dict]:
     try:
         purchase_bounds = body.purchase_bounds()
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    cid = correlation_id(request, response)
     filters: list[dict] = []
     for field, facet in _ASSET_FILTER_FIELDS.items():
         value = getattr(body, field)
@@ -711,6 +722,69 @@ async def search_assets(body: AssetSearchRequest, request: Request, response: Re
         start, end = purchase_bounds
         value = f"daterange:{start:%m/%d/%Y}-{end:%m/%d/%Y}"
         filters.append({"Facet": "purchaseddate", "Value": value, "GroupIndex": 0})
+    return filters
+
+
+def _csv_safe(value) -> str:
+    text = "" if value is None else str(value)
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
+def _report_paths(token: str) -> tuple[Path, Path]:
+    return REPORT_DIRECTORY / f"{token}.csv", REPORT_DIRECTORY / f"{token}.json"
+
+
+def _cleanup_expired_reports(now: float | None = None) -> None:
+    if not REPORT_DIRECTORY.is_dir():
+        return
+    current = time.time() if now is None else now
+    for metadata_path in REPORT_DIRECTORY.glob("*.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            expired = float(metadata.get("expires_at", 0)) <= current
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            expired = True
+        if expired:
+            csv_path = metadata_path.with_suffix(".csv")
+            csv_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+
+
+def _asset_csv_row(summary: AssetSummary) -> dict[str, str]:
+    values = {
+        "AssetId": summary.asset_id,
+        "AssetTag": summary.asset_tag,
+        "SerialNumber": summary.serial_number,
+        "Name": summary.name,
+        "AssetType": summary.asset_type,
+        "Category": summary.category,
+        "Manufacturer": summary.manufacturer,
+        "Model": summary.model,
+        "Status": summary.status,
+        "Location": summary.location,
+        "Room": summary.room,
+        "PurchasedDate": summary.purchased_date,
+    }
+    return {key: _csv_safe(value) for key, value in values.items()}
+
+
+@app.post(
+    "/assets/search",
+    operation_id="iiq_search_assets",
+    summary="Search and count Incident IQ assets",
+    description=(
+        "Search visible assets using allowlisted model, type, category, manufacturer, status, location, identifier, "
+        "and purchase-date filters. Returns IIQ's exact filtered total plus bounded compact summaries; it cannot modify assets."
+    ),
+    response_model=AssetSearchResponse,
+    dependencies=[Depends(require_caller)],
+    tags=["assets"],
+)
+async def search_assets(body: AssetSearchRequest, request: Request, response: Response) -> AssetSearchResponse:
+    cid = correlation_id(request, response)
+    filters = await _build_asset_filters(body, cid)
 
     assets: list[AssetSummary] = []
     total_count = 0
@@ -740,6 +814,99 @@ async def search_assets(body: AssetSearchRequest, request: Request, response: Re
         pages_scanned=pages_scanned,
         truncated=total_count > len(assets),
         assets=assets,
+    )
+
+
+@app.post(
+    "/assets/export",
+    operation_id="iiq_export_assets_csv",
+    summary="Export matching Incident IQ assets to a short-lived CSV",
+    description=(
+        "Create a bounded CSV export using the same allowlisted filters as iiq_search_assets. "
+        "Use this for downloads and large result sets so asset rows do not enter model context."
+    ),
+    response_model=AssetExportResponse,
+    dependencies=[Depends(require_caller)],
+    tags=["assets"],
+)
+async def export_assets_csv(body: AssetExportRequest, request: Request, response: Response) -> AssetExportResponse:
+    cid = correlation_id(request, response)
+    filters = await _build_asset_filters(body, cid)
+    configured_max = max(1, min(settings.iiq_export_max_rows, 25_000))
+    max_rows = min(body.max_rows, configured_max)
+    page_size = max(1, min(settings.iiq_export_page_size, 200, max_rows))
+    ttl_seconds = max(60, min(settings.iiq_report_ttl_seconds, 3600))
+    _cleanup_expired_reports()
+    REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    csv_path, metadata_path = _report_paths(token)
+    total_count = 0
+    exported_count = 0
+    try:
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=_ASSET_CSV_FIELDS, lineterminator="\n")
+            writer.writeheader()
+            for page in range((max_rows + page_size - 1) // page_size):
+                remaining = max_rows - exported_count
+                raw = await iiq.post_read_query(
+                    "assets",
+                    cid,
+                    {"Schema": "All", "OnlyShowDeleted": False, "Filters": filters, "FilterByViewPermission": True},
+                    {"$s": min(page_size, remaining), "$p": page, "$o": "AssetTag ASC"},
+                )
+                records = _asset_records(raw)
+                total_count = _asset_total(raw)
+                for record in records[:remaining]:
+                    writer.writerow(_asset_csv_row(_asset_summary(record)))
+                    exported_count += 1
+                if not records or exported_count >= total_count or exported_count >= max_rows:
+                    break
+        filename = f"iiq-assets-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.csv"
+        expires_at = time.time() + ttl_seconds
+        metadata_path.write_text(
+            json.dumps({"filename": filename, "expires_at": expires_at}),
+            encoding="utf-8",
+        )
+        csv_path.chmod(0o600)
+        metadata_path.chmod(0o600)
+    except Exception:
+        csv_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        raise
+    base_url = settings.iiq_public_base_url.strip().rstrip("/") or str(request.base_url).rstrip("/")
+    return AssetExportResponse(
+        correlation_id=cid,
+        total_count=total_count,
+        exported_count=exported_count,
+        truncated=total_count > exported_count,
+        filename=filename,
+        download_url=f"{base_url}/reports/assets/{token}",
+        expires_in_seconds=ttl_seconds,
+    )
+
+
+@app.get("/reports/assets/{token}", include_in_schema=False, name="download_asset_report")
+async def download_asset_report(token: str) -> Response:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,60}", token):
+        return PlainTextResponse("Report not found or expired", status_code=404)
+    _cleanup_expired_reports()
+    csv_path, metadata_path = _report_paths(token)
+    if not csv_path.is_file() or not metadata_path.is_file():
+        return PlainTextResponse("Report not found or expired", status_code=404)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if float(metadata["expires_at"]) <= time.time():
+            raise ValueError("expired")
+        filename = str(metadata["filename"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        csv_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        return PlainTextResponse("Report not found or expired", status_code=404)
+    return FileResponse(
+        csv_path,
+        media_type="text/csv; charset=utf-8",
+        filename=filename,
+        headers={"Cache-Control": "no-store, private", "X-Content-Type-Options": "nosniff"},
     )
 
 

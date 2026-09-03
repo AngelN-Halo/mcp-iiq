@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     api_access_token: SecretStr = SecretStr("")
     iiq_timeout_seconds: float = 20.0
     iiq_max_response_bytes: int = 5_000_000
+    iiq_export_max_rows: int = 25_000
+    iiq_export_page_size: int = 200
+    iiq_report_ttl_seconds: int = 900
+    iiq_public_base_url: str = ""
     iiq_verify_ssl: bool = True
     iiq_enable_advanced_read: bool = False
     iiq_allowed_read_prefixes: str = "tickets,assets,users,locations,categories,issues,products"
@@ -40,4 +44,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
