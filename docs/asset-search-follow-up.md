@@ -1,6 +1,6 @@
 # Asset inventory search follow-up
 
-Status: implemented in version 0.2.0 as `iiq_search_assets`; version 0.3.0 added `iiq_export_assets_csv` for token-efficient bulk downloads.
+Status: implemented in version 0.2.0 as `iiq_search_assets`; version 0.3.0 added `iiq_export_assets_csv`; version 0.4.0 added exact current-owner filtering and owner/inventory fields.
 
 ## Finding
 

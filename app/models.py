@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -49,9 +50,13 @@ class AssetFilterRequest(BaseModel):
     location: str | None = Field(default=None, min_length=2, max_length=150)
     asset_tag: str | None = Field(default=None, min_length=1, max_length=100)
     serial_number: str | None = Field(default=None, min_length=1, max_length=150)
+    owner_id: UUID | None = Field(default=None, description="Exact Incident IQ user identifier for the current asset owner.")
+    owner_email: str | None = Field(default=None, min_length=3, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    owner_username: str | None = Field(default=None, min_length=1, max_length=150)
+    owner_name: str | None = Field(default=None, min_length=2, max_length=150, description="Exact owner display name; ambiguous matches are rejected.")
     purchased_after: date | None = None
     purchased_before: date | None = None
-    @field_validator("model", "asset_type", "category", "manufacturer", "status", "location", "asset_tag", "serial_number")
+    @field_validator("model", "asset_type", "category", "manufacturer", "status", "location", "asset_tag", "serial_number", "owner_email", "owner_username", "owner_name")
     @classmethod
     def normalize_asset_text(cls, value: str | None) -> str | None:
         return " ".join(value.split()) if value is not None else None
@@ -88,9 +93,16 @@ class AssetSummary(BaseModel):
     manufacturer: str | None = None
     model: str | None = None
     status: str | None = None
+    owner_id: str | None = None
+    owner_name: str | None = None
+    owner_email: str | None = None
+    owner_username: str | None = None
     location: str | None = None
     room: str | None = None
     purchased_date: str | None = None
+    last_inventory_date: str | None = None
+    last_verification_at: str | None = None
+    last_verification_successful: bool | None = None
 
 
 class AssetSearchResponse(BaseModel):
@@ -99,6 +111,7 @@ class AssetSearchResponse(BaseModel):
     returned_count: int
     pages_scanned: int
     truncated: bool
+    owner_filter_id: str | None = None
     assets: list[AssetSummary]
 
 
@@ -107,6 +120,7 @@ class AssetExportResponse(BaseModel):
     total_count: int
     exported_count: int
     truncated: bool
+    owner_filter_id: str | None = None
     filename: str
     download_url: str
     expires_in_seconds: int

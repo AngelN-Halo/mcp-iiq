@@ -562,7 +562,9 @@ def test_asset_csv_export_creates_bounded_download_without_rows_in_tool_response
     assert rows[0]["AssetTag"] == "'=FORMULA"
     assert list(rows[0]) == [
         "AssetId", "AssetTag", "SerialNumber", "Name", "AssetType", "Category",
-        "Manufacturer", "Model", "Status", "Location", "Room", "PurchasedDate",
+        "Manufacturer", "Model", "Status", "OwnerId", "OwnerName", "OwnerEmail",
+        "OwnerUsername", "Location", "Room", "PurchasedDate", "LastInventoryDate",
+        "LastVerificationAt", "LastVerificationSuccessful",
     ]
 
 
@@ -588,3 +590,148 @@ def test_asset_csv_download_expires_and_removes_files(monkeypatch, tmp_path) -> 
     assert expired.status_code == 404
     assert not list(tmp_path.iterdir())
     assert client.get("/reports/assets/not-a-valid-token").status_code == 404
+
+
+def test_asset_search_filters_exact_owner_id_and_returns_owner_inventory_fields(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    owner_id = "11111111-2222-4333-8444-555555555555"
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert path == "assets"
+        assert body["Filters"] == [{"Facet": "user", "Id": owner_id, "GroupIndex": 0}]
+        return {
+            "Items": [{
+                "AssetId": "asset-one",
+                "AssetTag": "TEST-ONE",
+                "SerialNumber": "SERIAL-ONE",
+                "Model": {
+                    "Name": "Synthetic Laptop",
+                    "Manufacturer": {"Name": "Example Manufacturer"},
+                    "Category": {"Name": "Laptop"},
+                },
+                "Status": {"Name": "Checked Out"},
+                "OwnerId": owner_id,
+                "Owner": {
+                    "UserId": owner_id,
+                    "Name": "Taylor Owner",
+                    "Email": "taylor.owner@example.invalid",
+                    "Username": "taylor.owner",
+                },
+                "Location": {"Name": "Example Campus"},
+                "LocationRoom": {"Name": "Room 101"},
+                "LastInventoryDate": "2026-08-01T10:00:00Z",
+                "LastVerificationDateTime": "2026-08-02T11:00:00Z",
+                "LastVerificationSuccessful": True,
+            }],
+            "Paging": {"TotalRows": 1},
+        }
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"owner_id": owner_id},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["owner_filter_id"] == owner_id
+    assert result["total_count"] == 1
+    assert result["assets"][0]["owner_name"] == "Taylor Owner"
+    assert result["assets"][0]["last_inventory_date"] == "2026-08-01T10:00:00Z"
+    assert result["assets"][0]["last_verification_successful"] is True
+
+
+def test_asset_search_resolves_owner_email_to_one_exact_user(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    owner_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        if path == "search/v2":
+            assert body["Query"] == "jamie.owner@example.invalid"
+            return {"Items": [{"Id": owner_id, "Name": "Jamie Owner"}]}
+        assert path == "assets"
+        assert body["Filters"] == [{"Facet": "user", "Id": owner_id, "GroupIndex": 0}]
+        return {"Items": [], "Paging": {"TotalRows": 0}}
+
+    async def fake_get(path, correlation_id, query=None):
+        assert path == f"users/{owner_id}"
+        return {"Item": {"UserId": owner_id, "Name": "Jamie Owner", "Email": "jamie.owner@example.invalid"}}
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    monkeypatch.setattr(iiq, "get", fake_get)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"owner_email": "jamie.owner@example.invalid"},
+    )
+    assert response.status_code == 200
+    assert response.json()["owner_filter_id"] == owner_id
+
+
+def test_asset_search_rejects_ambiguous_exact_owner_name(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    owner_ids = ["10000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002"]
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert path == "search/v2"
+        return {"Items": [{"Id": owner_id, "Name": "Taylor Owner"} for owner_id in owner_ids]}
+
+    async def fake_get(path, correlation_id, query=None):
+        owner_id = path.rsplit("/", 1)[-1]
+        return {"Item": {"UserId": owner_id, "Name": "Taylor Owner"}}
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    monkeypatch.setattr(iiq, "get", fake_get)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"owner_name": "Taylor Owner"},
+    )
+    assert response.status_code == 409
+    assert "owner_id" in response.json()["detail"]
+
+
+def test_asset_search_fails_closed_if_iiq_returns_wrong_owner(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    requested_id = "11111111-2222-4333-8444-555555555555"
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        return {
+            "Items": [{"AssetId": "unexpected", "OwnerId": "99999999-8888-4777-8666-555555555555"}],
+            "Paging": {"TotalRows": 1},
+        }
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"owner_id": requested_id},
+    )
+    assert response.status_code == 502
+    assert "outside the requested exact owner" in response.json()["detail"]
+
+
+def test_owner_search_requires_service_authorization(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+    response = client.post(
+        "/assets/search",
+        json={"owner_id": "11111111-2222-4333-8444-555555555555"},
+    )
+    assert response.status_code == 401
+
+
+def test_owner_search_preserves_iiq_view_permission_filter(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "api_access_token", type(settings.api_access_token)("expected"))
+
+    async def fake_post_read_query(path, correlation_id, body, query=None):
+        assert body["FilterByViewPermission"] is True
+        raise HTTPException(502, "Incident IQ rejected the integration credential or its permissions")
+
+    monkeypatch.setattr(iiq, "post_read_query", fake_post_read_query)
+    response = client.post(
+        "/assets/search",
+        headers={"Authorization": "Bearer expected"},
+        json={"owner_id": "11111111-2222-4333-8444-555555555555"},
+    )
+    assert response.status_code == 502
+    assert "permissions" in response.json()["detail"]

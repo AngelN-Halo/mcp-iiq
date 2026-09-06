@@ -49,7 +49,7 @@ REPORT_DIRECTORY = Path("/tmp/mcp-iiq-reports")
 
 app = FastAPI(
     title="Incident IQ Read-Only API",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Read-only, least-privileged OpenAPI interface for Incident IQ. "
         "This service implements downstream HTTP GET requests plus a fixed allowlist of non-mutating query POSTs, "
@@ -625,9 +625,16 @@ _ASSET_CSV_FIELDS = [
     "Manufacturer",
     "Model",
     "Status",
+    "OwnerId",
+    "OwnerName",
+    "OwnerEmail",
+    "OwnerUsername",
     "Location",
     "Room",
     "PurchasedDate",
+    "LastInventoryDate",
+    "LastVerificationAt",
+    "LastVerificationSuccessful",
 ]
 
 
@@ -682,6 +689,8 @@ def _asset_total(raw) -> int:
 
 def _asset_summary(record: dict) -> AssetSummary:
     model = _ci_get(record, "Model")
+    owner = _ci_get(record, "Owner")
+    verification_success = _ci_get(record, "LastVerificationSuccessful")
     return AssetSummary(
         asset_id=_display(_ci_get(record, "AssetId", "Id")),
         asset_tag=_display(_ci_get(record, "AssetTag")),
@@ -692,13 +701,90 @@ def _asset_summary(record: dict) -> AssetSummary:
         manufacturer=_display(_ci_get(model, "Manufacturer")) if isinstance(model, dict) else None,
         model=_display(model),
         status=_display(_ci_get(record, "Status")),
+        owner_id=_display(_ci_get(record, "OwnerId")) or (_display(_ci_get(owner, "UserId", "Id")) if isinstance(owner, dict) else None),
+        owner_name=_display(owner),
+        owner_email=_display(_ci_get(owner, "Email")) if isinstance(owner, dict) else None,
+        owner_username=_display(_ci_get(owner, "Username")) if isinstance(owner, dict) else None,
         location=_display(_ci_get(record, "Location")),
         room=_display(_ci_get(record, "LocationRoom")),
         purchased_date=_display(_ci_get(record, "PurchasedDate", "PurchaseDate")),
+        last_inventory_date=_display(_ci_get(record, "LastInventoryDate")),
+        last_verification_at=_display(_ci_get(record, "LastVerificationDateTime", "LastVerificationDate")),
+        last_verification_successful=verification_success if isinstance(verification_success, bool) else None,
     )
 
 
-async def _build_asset_filters(body: AssetFilterRequest, cid: str) -> list[dict]:
+def _user_search_candidates(value) -> set[tuple[str, str | None]]:
+    matches: set[tuple[str, str | None]] = set()
+    if isinstance(value, dict):
+        identifier = _display(_ci_get(value, "UserId", "EntityId", "Id"))
+        name = _display(_ci_get(value, "Name", "FullName", "DisplayName"))
+        if identifier and name:
+            matches.add((identifier, name))
+        for nested in value.values():
+            matches.update(_user_search_candidates(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            matches.update(_user_search_candidates(nested))
+    return matches
+
+
+def _user_detail(raw) -> dict:
+    item = _ci_get(raw, "Item") if isinstance(raw, dict) else None
+    if not isinstance(item, dict):
+        raise HTTPException(502, "Incident IQ user lookup returned an unexpected response shape")
+    return item
+
+
+def _normalized_identity(value: str | None) -> str:
+    return " ".join((value or "").split()).casefold()
+
+
+async def _resolve_asset_owner_id(body: AssetFilterRequest, cid: str) -> str | None:
+    supplied_id = str(body.owner_id) if body.owner_id is not None else None
+    selectors = [body.owner_email, body.owner_username, body.owner_name]
+    if supplied_id and not any(selectors):
+        return supplied_id
+    if not supplied_id and not any(selectors):
+        return None
+
+    if supplied_id:
+        candidate_ids = {supplied_id}
+    else:
+        query = body.owner_email or body.owner_username or body.owner_name
+        raw = await iiq.post_read_query(
+            "search/v2",
+            cid,
+            {"Query": query, "Facets": 4, "IncludeMatchedItem": False},
+        )
+        candidate_ids = {identifier for identifier, _ in _user_search_candidates(raw)}
+        if not candidate_ids:
+            raise HTTPException(404, "No matching Incident IQ asset owner was found")
+        if len(candidate_ids) > 25:
+            raise HTTPException(409, "The asset owner search is too broad; use an exact email, username, or user ID")
+
+    exact_ids: set[str] = set()
+    for identifier in candidate_ids:
+        raw = await iiq.get(f"users/{safe_segment(identifier, 'user ID')}", cid)
+        user = _user_detail(raw)
+        actual_id = _display(_ci_get(user, "UserId", "Id"))
+        if not actual_id or actual_id.casefold() != identifier.casefold():
+            continue
+        if body.owner_email and _normalized_identity(_display(_ci_get(user, "Email"))) != _normalized_identity(body.owner_email):
+            continue
+        if body.owner_username and _normalized_identity(_display(_ci_get(user, "Username"))) != _normalized_identity(body.owner_username):
+            continue
+        if body.owner_name and _normalized_identity(_display(_ci_get(user, "Name", "FullName"))) != _normalized_identity(body.owner_name):
+            continue
+        exact_ids.add(actual_id)
+    if not exact_ids:
+        raise HTTPException(404, "No exact Incident IQ asset-owner identity match was found")
+    if len(exact_ids) > 1:
+        raise HTTPException(409, "More than one exact Incident IQ asset-owner match was found; use owner_id")
+    return next(iter(exact_ids))
+
+
+async def _build_asset_filters(body: AssetFilterRequest, cid: str) -> tuple[list[dict], str | None]:
     try:
         purchase_bounds = body.purchase_bounds()
     except ValueError as exc:
@@ -722,7 +808,10 @@ async def _build_asset_filters(body: AssetFilterRequest, cid: str) -> list[dict]
         start, end = purchase_bounds
         value = f"daterange:{start:%m/%d/%Y}-{end:%m/%d/%Y}"
         filters.append({"Facet": "purchaseddate", "Value": value, "GroupIndex": 0})
-    return filters
+    owner_id = await _resolve_asset_owner_id(body, cid)
+    if owner_id:
+        filters.append({"Facet": "user", "Id": owner_id, "GroupIndex": 0})
+    return filters, owner_id
 
 
 def _csv_safe(value) -> str:
@@ -763,9 +852,16 @@ def _asset_csv_row(summary: AssetSummary) -> dict[str, str]:
         "Manufacturer": summary.manufacturer,
         "Model": summary.model,
         "Status": summary.status,
+        "OwnerId": summary.owner_id,
+        "OwnerName": summary.owner_name,
+        "OwnerEmail": summary.owner_email,
+        "OwnerUsername": summary.owner_username,
         "Location": summary.location,
         "Room": summary.room,
         "PurchasedDate": summary.purchased_date,
+        "LastInventoryDate": summary.last_inventory_date,
+        "LastVerificationAt": summary.last_verification_at,
+        "LastVerificationSuccessful": summary.last_verification_successful,
     }
     return {key: _csv_safe(value) for key, value in values.items()}
 
@@ -775,7 +871,7 @@ def _asset_csv_row(summary: AssetSummary) -> dict[str, str]:
     operation_id="iiq_search_assets",
     summary="Search and count Incident IQ assets",
     description=(
-        "Search visible assets using allowlisted model, type, category, manufacturer, status, location, identifier, "
+        "Search visible assets using allowlisted owner, model, type, category, manufacturer, status, location, identifier, "
         "and purchase-date filters. Returns IIQ's exact filtered total plus bounded compact summaries; it cannot modify assets."
     ),
     response_model=AssetSearchResponse,
@@ -784,7 +880,7 @@ def _asset_csv_row(summary: AssetSummary) -> dict[str, str]:
 )
 async def search_assets(body: AssetSearchRequest, request: Request, response: Response) -> AssetSearchResponse:
     cid = correlation_id(request, response)
-    filters = await _build_asset_filters(body, cid)
+    filters, owner_filter_id = await _build_asset_filters(body, cid)
 
     assets: list[AssetSummary] = []
     total_count = 0
@@ -803,7 +899,12 @@ async def search_assets(body: AssetSearchRequest, request: Request, response: Re
         pages_scanned += 1
         records = _asset_records(raw)
         total_count = _asset_total(raw)
-        assets.extend(_asset_summary(record) for record in records)
+        summaries = [_asset_summary(record) for record in records]
+        if owner_filter_id and any(
+            not summary.owner_id or summary.owner_id.casefold() != owner_filter_id.casefold() for summary in summaries
+        ):
+            raise HTTPException(502, "Incident IQ returned an asset outside the requested exact owner filter")
+        assets.extend(summaries)
         if not records or len(assets) >= total_count:
             break
     assets = assets[: body.limit]
@@ -813,6 +914,7 @@ async def search_assets(body: AssetSearchRequest, request: Request, response: Re
         returned_count=len(assets),
         pages_scanned=pages_scanned,
         truncated=total_count > len(assets),
+        owner_filter_id=owner_filter_id,
         assets=assets,
     )
 
@@ -831,7 +933,7 @@ async def search_assets(body: AssetSearchRequest, request: Request, response: Re
 )
 async def export_assets_csv(body: AssetExportRequest, request: Request, response: Response) -> AssetExportResponse:
     cid = correlation_id(request, response)
-    filters = await _build_asset_filters(body, cid)
+    filters, owner_filter_id = await _build_asset_filters(body, cid)
     configured_max = max(1, min(settings.iiq_export_max_rows, 25_000))
     max_rows = min(body.max_rows, configured_max)
     page_size = max(1, min(settings.iiq_export_page_size, 200, max_rows))
@@ -856,8 +958,14 @@ async def export_assets_csv(body: AssetExportRequest, request: Request, response
                 )
                 records = _asset_records(raw)
                 total_count = _asset_total(raw)
-                for record in records[:remaining]:
-                    writer.writerow(_asset_csv_row(_asset_summary(record)))
+                summaries = [_asset_summary(record) for record in records[:remaining]]
+                if owner_filter_id and any(
+                    not summary.owner_id or summary.owner_id.casefold() != owner_filter_id.casefold()
+                    for summary in summaries
+                ):
+                    raise HTTPException(502, "Incident IQ returned an asset outside the requested exact owner filter")
+                for summary in summaries:
+                    writer.writerow(_asset_csv_row(summary))
                     exported_count += 1
                 if not records or exported_count >= total_count or exported_count >= max_rows:
                     break
@@ -879,6 +987,7 @@ async def export_assets_csv(body: AssetExportRequest, request: Request, response
         total_count=total_count,
         exported_count=exported_count,
         truncated=total_count > exported_count,
+        owner_filter_id=owner_filter_id,
         filename=filename,
         download_url=f"{base_url}/reports/assets/{token}",
         expires_in_seconds=ttl_seconds,
