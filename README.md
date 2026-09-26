@@ -1,5 +1,7 @@
 # mcp-iiq
 
+[**Read the web documentation →**](https://angeln-halo.github.io/mcp-iiq/)
+
 Read-only OpenAPI interface for Incident IQ. It is designed for registration as an OpenAPI tool in an AI/MCP environment while keeping the Incident IQ token server-side.
 
 Despite the repository name, version 0.4 is intentionally an **OpenAPI service**, not a native stdio/SSE MCP transport. This makes it straightforward to register in Open WebUI or any client that imports OpenAPI. A native MCP adapter can be added later over the same guarded client.
