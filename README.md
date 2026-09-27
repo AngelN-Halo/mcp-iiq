@@ -51,7 +51,7 @@ nano .env
 Set:
 
 - `IIQ_BASE_URL` to the tenant root, such as `https://district.incidentiq.com`
-- `IIQ_API_TOKEN` to the dedicated read-only token
+- `IIQ_API_TOKEN` to a dedicated IIQ API token provisioned with read-only permissions; verify its actual scope in IIQ
 - `IIQ_SITE_ID` and `IIQ_PRODUCT_ID` when required by Incident IQ
 - `API_ACCESS_TOKEN` to a different long random value used by the OpenAPI caller
 
@@ -101,7 +101,7 @@ For natural-language category/team questions, call `iiq_find_ticket_filters` fir
 
 For technician-assistant behavior, use the reusable prompt in `docs/technician-assistant-prompt.md`. It directs the assistant to call the consolidated context operation, distinguish ticket facts from recommendations, account for work already performed, identify missing information, and respect public versus internal timeline visibility.
 
-Future write-enabled ticket correction and routing ideas are captured in `docs/future-ticket-adjustment-automation.md`. The initial design is recommendation-only with technician approval, exact taxonomy IDs, confidence/stop rules, and an audit trail.
+If write-enabled experiments are added later, use a separate credential and separately reviewed tools; do not broaden this read-only integration token. Future write-enabled ticket correction and routing ideas are captured in `docs/future-ticket-adjustment-automation.md`. The initial design is recommendation-only with technician approval, exact taxonomy IDs, confidence/stop rules, and an audit trail.
 
 Asset inventory questions use `iiq_search_assets`. The operation resolves human-readable IIQ model, type, category, manufacturer, status, and location filters, supports exact asset-tag/serial filters and bounded purchase-date windows, and returns both IIQ's filtered total and compact asset summaries. For example, use `model: "Chromebook Plus"` with `status: "Available"` to count available Chromebook Plus models, or a July 2026 `purchased_after`/`purchased_before` window to count purchases. Results are capped at 200 summaries over no more than five pages; `total_count` remains the exact IIQ count and `truncated` indicates whether summaries were omitted.
 
